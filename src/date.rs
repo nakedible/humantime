@@ -1,10 +1,11 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::str;
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
+use std::time::SystemTime;
 
 #[cfg(target_os="cloudabi")]
 mod max {
+    #[allow(unused)]
     pub const SECONDS: u64 = ::std::u64::MAX / 1_000_000_000;
     #[allow(unused)]
     pub const TIMESTAMP: &'static str = "2554-07-21T23:34:33Z";
@@ -16,6 +17,7 @@ mod max {
     not(all(target_arch="wasm32", not(target_os="emscripten")))
 ))]
 mod max {
+    #[allow(unused)]
     pub const SECONDS: u64 = ::std::i32::MAX as u64;
     #[allow(unused)]
     pub const TIMESTAMP: &'static str = "2038-01-19T03:14:07Z";
@@ -27,6 +29,7 @@ mod max {
     all(target_arch="wasm32", not(target_os="emscripten")),
 ))]
 mod max {
+    #[allow(unused)]
     pub const SECONDS: u64 = 253_402_300_800-1;  // last second of year 9999
     #[allow(unused)]
     pub const TIMESTAMP: &str = "9999-12-31T23:59:59Z";
@@ -121,50 +124,28 @@ pub fn parse_rfc3339_weak(s: &str) -> Result<SystemTime, Error> {
     {
         return Err(Error::InvalidFormat);
     }
-    let year = two_digits(b[0], b[1])? * 100 + two_digits(b[2], b[3])?;
+    let year = two_digits(b[0], b[1])? as i32 * 100 + two_digits(b[2], b[3])? as i32;
     let month = two_digits(b[5], b[6])?;
     let day = two_digits(b[8], b[9])?;
     let hour = two_digits(b[11], b[12])?;
     let minute = two_digits(b[14], b[15])?;
     let mut second = two_digits(b[17], b[18])?;
 
-    if year < 1970 || hour > 23 || minute > 59 || second > 60 {
+    if year < 1970
+        || month < 1
+        || month > 12
+        || day < 1
+        || day > datealgo::days_in_month(year, month as u8) as u64
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return Err(Error::OutOfRange);
     }
     // TODO(tailhook) should we check that leaps second is only on midnight ?
     if second == 60 {
         second = 59;
     }
-
-    let leap = is_leap_year(year);
-    let (mut ydays, mdays) = match month {
-        1 => (0, 31),
-        2 if leap => (31, 29),
-        2 => (31, 28),
-        3 => (59, 31),
-        4 => (90, 30),
-        5 => (120, 31),
-        6 => (151, 30),
-        7 => (181, 31),
-        8 => (212, 31),
-        9 => (243, 30),
-        10 => (273, 31),
-        11 => (304, 30),
-        12 => (334, 31),
-        _ => return Err(Error::OutOfRange),
-    };
-    if day > mdays || day == 0 {
-        return Err(Error::OutOfRange);
-    }
-    ydays += day - 1;
-    if leap && month > 2 {
-        ydays += 1;
-    }
-
-    let leap_years = ((year - 1) - 1968) / 4 - ((year - 1) - 1900) / 100 + ((year - 1) - 1600) / 400;
-    let days = (year - 1970) * 365 + leap_years + ydays;
-
-    let time = second + minute * 60 + hour * 3600;
 
     let mut nanos = 0;
     let mut mult = 100_000_000;
@@ -185,16 +166,16 @@ pub fn parse_rfc3339_weak(s: &str) -> Result<SystemTime, Error> {
         return Err(Error::InvalidFormat);
     }
 
-    let total_seconds = time + days * 86400;
-    if total_seconds > max::SECONDS {
-        return Err(Error::OutOfRange);
-    }
-
-    Ok(UNIX_EPOCH + Duration::new(total_seconds, nanos))
-}
-
-fn is_leap_year(y: u64) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+    datealgo::datetime_to_systemtime((
+        year,
+        month as u8,
+        day as u8,
+        hour as u8,
+        minute as u8,
+        second as u8,
+        nanos,
+    ))
+    .ok_or(Error::OutOfRange)
 }
 
 /// Format an RFC3339 timestamp `2018-02-14T00:28:07Z`
@@ -255,63 +236,12 @@ impl fmt::Display for Rfc3339Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::Precision::*;
 
-        let dur = self.0.duration_since(UNIX_EPOCH)
-            .expect("all times should be after the epoch");
-        let secs_since_epoch = dur.as_secs();
-        let nanos = dur.subsec_nanos();
+        let (year, mon, mday, hours, minutes, seconds, nanos) =
+            datealgo::systemtime_to_datetime(self.0).expect("all times should be representable");
 
-        if secs_since_epoch >= 253_402_300_800 { // year 9999
+        if year > 9999 || year < 1970 {
             return Err(fmt::Error);
         }
-
-        /* 2000-03-01 (mod 400 year, immediately after feb29 */
-        const LEAPOCH: i64 = 11017;
-        const DAYS_PER_400Y: i64 = 365*400 + 97;
-        const DAYS_PER_100Y: i64 = 365*100 + 24;
-        const DAYS_PER_4Y: i64 = 365*4 + 1;
-
-        let days = (secs_since_epoch / 86400) as i64 - LEAPOCH;
-        let secs_of_day = secs_since_epoch % 86400;
-
-        let mut qc_cycles = days / DAYS_PER_400Y;
-        let mut remdays = days % DAYS_PER_400Y;
-
-        if remdays < 0 {
-            remdays += DAYS_PER_400Y;
-            qc_cycles -= 1;
-        }
-
-        let mut c_cycles = remdays / DAYS_PER_100Y;
-        if c_cycles == 4 { c_cycles -= 1; }
-        remdays -= c_cycles * DAYS_PER_100Y;
-
-        let mut q_cycles = remdays / DAYS_PER_4Y;
-        if q_cycles == 25 { q_cycles -= 1; }
-        remdays -= q_cycles * DAYS_PER_4Y;
-
-        let mut remyears = remdays / 365;
-        if remyears == 4 { remyears -= 1; }
-        remdays -= remyears * 365;
-
-        let mut year = 2000 +
-            remyears + 4*q_cycles + 100*c_cycles + 400*qc_cycles;
-
-        let months = [31,30,31,30,31,31,30,31,30,31,31,29];
-        let mut mon = 0;
-        for mon_len in months.iter() {
-            mon += 1;
-            if remdays < *mon_len {
-                break;
-            }
-            remdays -= *mon_len;
-        }
-        let mday = remdays+1;
-        let mon = if mon + 2 > 12 {
-            year += 1;
-            mon - 10
-        } else {
-            mon + 2
-        };
 
         const BUF_INIT: [u8; 30] = *b"0000-00-00T00:00:00.000000000Z";
 
@@ -324,12 +254,12 @@ impl fmt::Display for Rfc3339Timestamp {
         buf[6] = b'0' + (mon % 10) as u8;
         buf[8] = b'0' + (mday / 10) as u8;
         buf[9] = b'0' + (mday % 10) as u8;
-        buf[11] = b'0' + (secs_of_day / 3600 / 10) as u8;
-        buf[12] = b'0' + (secs_of_day / 3600 % 10) as u8;
-        buf[14] = b'0' + (secs_of_day / 60 / 10 % 6) as u8;
-        buf[15] = b'0' + (secs_of_day / 60 % 10) as u8;
-        buf[17] = b'0' + (secs_of_day / 10 % 6) as u8;
-        buf[18] = b'0' + (secs_of_day % 10) as u8;
+        buf[11] = b'0' + (hours / 10) as u8;
+        buf[12] = b'0' + (hours % 10) as u8;
+        buf[14] = b'0' + (minutes / 10) as u8;
+        buf[15] = b'0' + (minutes % 10) as u8;
+        buf[17] = b'0' + (seconds / 10) as u8;
+        buf[18] = b'0' + (seconds % 10) as u8;
 
         let offset = if self.1 == Seconds || nanos == 0 && self.1 == Smart {
             buf[19] = b'Z';

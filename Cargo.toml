@@ -22,3 +22,6 @@ path = "src/lib.rs"
 time = "0.1"
 chrono = "0.4"
 rand = "0.6"
+
+[dependencies]
+datealgo = "0.0.6"
